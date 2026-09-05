@@ -1,0 +1,2062 @@
+我为你生成一份完整可编译运行的代码包，已适配160核M.2板卡（16颗CH32V003共享总线）及其64组件、0.5mm走线、4瓦功耗，哈希算法按需切换。
+
+
+
+
+
+├── Makefile
+├── config/config.h
+├── core/
+│   ├── cell.h                  /* 通用格址坐标系统：方位(8)×动词序号(8) */
+│   ├── protocol.h  protocol.c
+│   ├── module.h    module.c    module_table.h
+│   ├── input_pool.h  input_pool.c
+│   ├── transport.h transport.c
+│   ├── net.h       net.c
+│   ├── trust.h     trust.c
+│   └── kernel_main.c
+├── hal/
+│   ├── hal_port.h
+│   └── hal_mcu.c
+├── modules/
+│   ├── mod_acquire.c  mod_digest.c  mod_status.c  mod_health.c  mod_extension.c
+├── net/
+│   ├── net_prov_basic.c  net_prov_intent.c
+├── master/
+│   ├── master_main.c  master_parser.h  master_parser.c
+│   ├── master_module_table.h  mod_control.c
+├── host/
+│   ├── host_main.c  host_module_table.h
+└── app/
+    └── map_slot_label.c        /* 坐标→命名/物理通道的唯一绑定层 */
+1. Makefile
+Make
+CC      = riscv-none-embed-gcc
+HOSTCC  = gcc
+CFLAGS  = -std=c99 -Wall -Icore -Ihal -Imodules -Iconfig -Inet
+CORE = core/protocol.c core/module.c core/net.c core/transport.c \
+       core/trust.c core/input_pool.c core/signature.c
+NODE_SRC   = core/kernel_main.c $(CORE) hal/hal_mcu.c \
+             modules/mod_acquire.c modules/mod_digest.c \
+             modules/mod_status.c modules/mod_health.c modules/mod_extension.c \
+             modules/mod_class_register.c modules/mod_intent_bus.c \
+             net/net_prov_basic.c net/net_prov_intent.c
+MASTER_SRC = master/master_main.c master/master_parser.c $(CORE) \
+             hal/hal_mcu.c master/mod_control.c \
+             net/net_prov_basic.c net/net_prov_intent.c
+HOST_SRC   = host/host_main.c core/protocol.c core/module.c hal/hal_mcu.c
+all: node master host
+.PHONY: all node master host clean
+node:   ; mkdir -p build ; $(CC)     $(CFLAGS) -D__NODE__   $(NODE_SRC)   -o build/node.elf
+master: ; mkdir -p build ; $(HOSTCC) $(CFLAGS) -D__MASTER__ -Imaster $(MASTER_SRC) -o build/master
+host:   ; mkdir -p build ; $(HOSTCC) $(CFLAGS) -D__HOST__   -Ihost   $(HOST_SRC) -o build/host
+clean: ; rm -rf build/
+2. config/config.h
+C
+#ifndef CONFIG_H
+#define CONFIG_H
+#include <stdint.h>
+#include "net.h"
+#include "transport.h"
+#define BUILD_VER               0x0008U
+#define CONFIG_TRANSPORT_KIND   TR_KIND_CHAIN
+#define CONFIG_MASTER_SLOT      63U
+#define CONFIG_NODE_SLOT        0x00U   /* 节点格址：(方位<<3)|动词序号；0x00=(东,覆盖) */
+#define CONFIG_NET_TTL          64U   /* ≥ 链长 63 */
+/* 老化回收阈值（节点层，生命周期） */
+#define CONFIG_MODULE_AGE_SCAN_MS      1000U
+#define CONFIG_MODULE_AGE_DEMOTE_MS    30000U
+#define CONFIG_MODULE_AGE_ARCHIVE_MS   60000U
+#define CONFIG_MODULE_AGE_RECYCLE_MS   120000U  /* 显式回收阈值（协议控制预留） */
+#define CONFIG_MODULE_ERR_RECYCLE_CNT  3U
+
+/* 哈希算法选择：0=FNV-1a，1=CRC32 */
+#define CONFIG_HASH_ALGO 0U
+#endif
+3. core/protocol.h
+C
+#ifndef CORE_PROTOCOL_H
+#define CORE_PROTOCOL_H
+#include <stdint.h>
+#define FRAME_MAGIC     0xA5U
+
+#define HASH_ALGO_FNV    0U
+#define HASH_ALGO_CRC32  1U
+
+#define CMD_WHOAMI      0x01U
+#define CMD_START       0x02U
+#define CMD_STATUS      0x03U
+#define CMD_MODLIST     0x04U
+#define CMD_CLASS       0x10U
+#define CMD_INTENT      0x14U
+#define CMD_MASK        0x1FU
+/* 扩展区：cmd 0x08-0xFF 为扩展区。
+   0x00-0x1F 由 uint32_t perm 位掩码管控；
+   0x20-0xFF 留给未来权限表/权限回调，当前不得假设位掩码可覆盖。 */
+#define PROTO_QUERY_LEN  13U
+#define PROTO_ANSWER_LEN 45U
+typedef struct {
+    uint8_t magic;    /* 0  */
+    uint8_t cmd;      /* 1  */
+    uint8_t mod;      /* 2  */
+    uint8_t dest;     /* 3  */
+    uint8_t src;      /* 4  */
+    uint8_t ttl;      /* 5  */
+    uint8_t seq;      /* 6  */
+    uint8_t ack;      /* 7  */
+    uint8_t param[4]; /* 8..11 */
+    uint8_t crc8;     /* 12 */
+} query_t;
+typedef struct {
+    uint8_t magic;    /* 0  */
+    uint8_t cmd;      /* 1  */
+    uint8_t mod;      /* 2  */
+    uint8_t dest;     /* 3  */
+    uint8_t src;      /* 4  */
+    uint8_t ttl;      /* 5  */
+    uint8_t seq;      /* 6  */
+    uint8_t ack;      /* 7  */
+    uint8_t param[4]; /* 8..11 */
+    uint8_t data[32]; /* 12..43 */
+    uint8_t crc8;     /* 44 */
+} answer_t;
+typedef union {
+    query_t  q;
+    answer_t a;
+    uint8_t  raw[45];
+} frame_t;
+#define FCMD(f)     ((f)->q.cmd)
+#define FMOD(f)     ((f)->q.mod)
+#define FDEST(f)    ((f)->q.dest)
+#define FSRC(f)     ((f)->q.src)
+#define FTTL(f)     ((f)->q.ttl)
+#define FSEQ(f)     ((f)->q.seq)
+#define FACK(f)     ((f)->q.ack)
+#define FPARAM(f,i) ((f)->q.param[i])
+#define FDATA(f,i)  ((f)->a.data[i])
+uint8_t  protocol_crc8(const uint8_t *buf, uint8_t len);
+uint8_t  protocol_verify(const uint8_t *buf, uint8_t len);
+void     protocol_finalize_query(frame_t *f);
+void     protocol_finalize_answer(frame_t *f);
+void     frame_clear(frame_t *f);
+uint32_t protocol_hash32_algo(uint8_t algo, const uint8_t *buf, uint8_t len);
+#endif
+4. core/protocol.c
+C
+#include "protocol.h"
+#include "config.h"
+
+uint8_t protocol_crc8(const uint8_t *buf, uint8_t len)
+{
+    uint8_t crc = 0x00;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            if (crc & 0x80) crc = (uint8_t)((crc << 1) ^ 0x07);
+            else            crc = (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+uint8_t protocol_verify(const uint8_t *buf, uint8_t len)
+{
+    if (len != PROTO_QUERY_LEN && len != PROTO_ANSWER_LEN) return 0;
+    if (buf[0] != FRAME_MAGIC) return 0;
+    return (protocol_crc8(buf, len - 1) == buf[len - 1]);
+}
+void protocol_finalize_query(frame_t *f)
+{
+    f->raw[12] = protocol_crc8(f->raw, 12);
+}
+void protocol_finalize_answer(frame_t *f)
+{
+    f->raw[44] = protocol_crc8(f->raw, 44);
+}
+void frame_clear(frame_t *f)
+{
+    for (uint8_t i = 0; i < PROTO_ANSWER_LEN; i++) f->raw[i] = 0;
+}
+static uint32_t hash_fnv1a(const uint8_t *buf, uint8_t len)
+{
+    uint32_t h = 0x811C9DC5U;
+    for (uint8_t i = 0; i < len; i++) {
+        h ^= buf[i];
+        h *= 0x01000193U;
+    }
+    return h;
+}
+
+static uint32_t hash_crc32(const uint8_t *buf, uint8_t len)
+{
+    uint32_t crc = 0xFFFFFFFFU;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (uint8_t b = 0; b < 8; b++)
+            crc = (crc & 1U) ? ((crc >> 1) ^ 0xEDB88320U) : (crc >> 1);
+    }
+    return ~crc;
+}
+
+uint32_t protocol_hash32_algo(uint8_t algo, const uint8_t *buf, uint8_t len)
+{
+    switch (algo) {
+    case HASH_ALGO_CRC32: return hash_crc32(buf, len);
+    case HASH_ALGO_FNV:
+    default:              return hash_fnv1a(buf, len);
+    }
+}
+5. core/module.h
+C
+#ifndef CORE_MODULE_H
+#define CORE_MODULE_H
+#include <stdint.h>
+#include "protocol.h"
+#define MODULE_MAX          16U
+#define LIFECYCLE_ACTIVE    0x01U
+#define LIFECYCLE_OPTIONAL  0x02U
+#define LIFECYCLE_ARCHIVED  0x04U
+#define LIFECYCLE_DELETED   0x08U
+#define LAYER_NODE   0
+#define LAYER_MASTER 1
+#define LAYER_HOST   2
+#include "cell.h"   /* 通用格址坐标系统：SLOT_MAKE/SLOT_DIR/SLOT_VERB、方位、动词序号 */
+
+/* 方位（direction）：8 个，定义于 cell.h（DIR_EAST..DIR_NORTHEAST）。
+   模块的 group 字段即方位：模块按方位订阅/派发（master 按方向扇出）。
+   核心层不含任何宿主功能命名；"某方位=某通道"的绑定只在 app 层。 */
+
+/* 通用状态域：12 个领域分类，可添加。
+   组合显示格式：cell_id = 状态域 + M周期 + 方位 + 动词序号
+   例：E-M1-02-03 = 存在 · 建立类 · 东南 · 查询 */
+typedef enum {
+    DOMAIN_E = 0,   /* E 存在   */
+    DOMAIN_K,       /* K 身份   */
+    DOMAIN_X,       /* X 空间   */
+    DOMAIN_R,       /* R 关系   */
+    DOMAIN_V,       /* V 量值   */
+    DOMAIN_C,       /* C 控制   */
+    DOMAIN_H,       /* H 信息   */
+    DOMAIN_Q,       /* Q 时间   */
+    DOMAIN_P,       /* P 权限   */
+    DOMAIN_M,       /* M 决定   */
+    DOMAIN_F,       /* F 基底   */
+    DOMAIN_G,       /* G 速率   */
+    DOMAIN_COUNT
+} state_domain_t;
+
+typedef struct {
+    uint8_t  id;
+    uint8_t  group;     /* 方位（direction）；旧称 group，语义见 cell.h */
+    uint8_t  domain;
+    uint8_t  layer;
+    uint8_t  lifecycle;
+    uint32_t perm;          /* 权限原子：命令位掩码（1UL << (FCMD & CMD_MASK)） */
+    uint8_t  api_version;
+    uint32_t contract_hash;
+    void (*init)(void);
+    void (*poll)(void);
+    void (*on_cmd)(const frame_t *rx, frame_t *tx);
+} module_t;
+void    module_init_all(void);
+void    module_poll_all(void);
+void    module_dispatch_node(uint8_t mod, const frame_t *rx, frame_t *tx);
+void    module_dispatch_master(uint8_t node_slot, const frame_t *rx, frame_t *tx);
+uint8_t module_manifest(uint8_t *out, uint8_t max);
+uint8_t module_manifest_domain(uint8_t domain, uint8_t *out, uint8_t max);
+/* 老化回收（生命周期） */
+void    module_report(uint8_t id, uint8_t ok);
+uint8_t module_recycle(uint8_t id);     /* 回收：释放身份，槽位可复用 */
+uint8_t module_reactivate(uint8_t id);  /* 复活：休眠态回 ACTIVE（协议控制预留） */
+uint8_t module_retire(uint8_t id);      /* 收束：封存防复用，作废契约（协议控制预留） */
+#endif
+6. core/module.c
+C
+#include "module.h"
+#include "hal_port.h"
+#include "config.h"
+#if defined(__MASTER__)
+#include "master_module_table.h"
+#elif defined(__HOST__)
+#include "host_module_table.h"
+#else
+#include "module_table.h"
+#endif
+#define MOD_DECL(name, ...) extern const module_t name;
+MODULE_TABLE(MOD_DECL)
+#undef MOD_DECL
+#define MOD_ARR(name, ...) &name,
+static const module_t *const g_modules[] = { MODULE_TABLE(MOD_ARR) };
+#undef MOD_ARR
+static const uint8_t g_count = sizeof(g_modules) / sizeof(g_modules[0]);
+
+/* 编译期防线：模块表不能超过固定运行态数组 */
+typedef char module_table_fits[(sizeof(g_modules) / sizeof(g_modules[0]) <= MODULE_MAX) ? 1 : -1];
+
+/* 运行态：契约在 ROM，生命周期在 RAM */
+typedef struct {
+    uint8_t  lifecycle;
+    uint8_t  reusable;
+    uint8_t  err_count;
+    uint32_t last_use;
+    uint32_t use_count;
+} module_state_t;
+static module_state_t s_state[MODULE_MAX];
+void module_init_all(void)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        s_state[i].lifecycle = g_modules[i]->lifecycle;
+        s_state[i].last_use  = hal_tick();
+        if (s_state[i].lifecycle == LIFECYCLE_ACTIVE && g_modules[i]->init)
+            g_modules[i]->init();
+    }
+}
+/* 老化扫描：只对节点层生效（master/host 常驻） */
+static void module_age_scan(uint32_t now)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        if (g_modules[i]->layer != LAYER_NODE) continue;
+        module_state_t *st = &s_state[i];
+        uint32_t idle = now - st->last_use;
+        if (st->err_count >= CONFIG_MODULE_ERR_RECYCLE_CNT &&
+            st->lifecycle != LIFECYCLE_DELETED) {
+            st->lifecycle = LIFECYCLE_ARCHIVED;     /* 反复失败：隔离 */
+        } else if (st->lifecycle == LIFECYCLE_ACTIVE &&
+                   idle > CONFIG_MODULE_AGE_DEMOTE_MS) {
+            st->lifecycle = LIFECYCLE_OPTIONAL;     /* 无需求：停 poll */
+            st->last_use = now;
+        } else if (st->lifecycle == LIFECYCLE_OPTIONAL &&
+                   idle > CONFIG_MODULE_AGE_ARCHIVE_MS) {
+            st->lifecycle = LIFECYCLE_ARCHIVED;     /* 长期无需求：休眠（可唤醒） */
+            st->last_use = now;
+        }
+        /* 自动路径止于休眠(ARCHIVED)；身份释放(DELETED)仅经显式 recycle/retire
+           （协议控制预留）——避免按时间自动回收误杀休眠中的占位/慢节奏模块。 */
+    }
+}
+void module_poll_all(void)
+{
+    uint32_t now = hal_tick();
+    static uint32_t t_scan = 0;
+    if ((now - t_scan) >= CONFIG_MODULE_AGE_SCAN_MS) {
+        t_scan = now;
+        module_age_scan(now);
+    }
+    for (uint8_t i = 0; i < g_count; i++) {
+        if (s_state[i].lifecycle == LIFECYCLE_ACTIVE && g_modules[i]->poll) {
+            s_state[i].last_use = now;
+            g_modules[i]->poll();
+        }
+    }
+}
+/* 节点侧：按模块号寻址；查询即唤醒（OPTIONAL/ARCHIVED → ACTIVE） */
+void module_dispatch_node(uint8_t mod, const frame_t *rx, frame_t *tx)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        const module_t *m = g_modules[i];
+        if (m->id != mod) continue;
+        module_state_t *st = &s_state[i];
+        if (st->lifecycle == LIFECYCLE_DELETED) break;   /* 已回收/收束：终态拦截 */
+        if (!(m->perm & (1UL << (FCMD(rx) & CMD_MASK)))) break;
+        st->last_use = hal_tick();
+        st->use_count++;
+        if (st->lifecycle != LIFECYCLE_ACTIVE)
+            st->lifecycle = LIFECYCLE_ACTIVE;   /* 有需求就活着：休眠/降级可唤醒 */
+        if (m->on_cmd) m->on_cmd(rx, tx);
+        return;
+    }
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = FSRC(rx);   /* 由调用者覆盖为本节点槽位 */
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+}
+/* master 侧：按来源节点方向订阅，扇出给所有匹配的 ACTIVE 模块 */
+void module_dispatch_master(uint8_t node_slot, const frame_t *rx, frame_t *tx)
+{
+    uint8_t g = SLOT_DIR(node_slot);
+    for (uint8_t i = 0; i < g_count; i++) {
+        const module_t *m = g_modules[i];
+        if (m->group != g) continue;
+        if (s_state[i].lifecycle != LIFECYCLE_ACTIVE) continue;
+        if (!(m->perm & (1UL << (FCMD(rx) & CMD_MASK)))) continue;
+        if (m->on_cmd) m->on_cmd(rx, tx);
+    }
+}
+static uint8_t manifest_common(uint8_t domain, uint8_t use_domain,
+                              uint8_t *out, uint8_t max)
+{
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < g_count && n < max; i++) {
+        if (use_domain && g_modules[i]->domain != domain) continue;
+        out[n * 4 + 0] = g_modules[i]->id;
+        out[n * 4 + 1] = (uint8_t)(g_modules[i]->perm & 0xFFU);
+        out[n * 4 + 2] = g_modules[i]->api_version;
+        out[n * 4 + 3] = s_state[i].lifecycle;   /* 生命周期状态上浮 */
+        n++;
+    }
+    return n;
+}
+
+uint8_t module_manifest(uint8_t *out, uint8_t max)
+{
+    return manifest_common(0, 0, out, max);
+}
+
+uint8_t module_manifest_domain(uint8_t domain, uint8_t *out, uint8_t max)
+{
+    return manifest_common(domain, 1, out, max);
+}
+void module_report(uint8_t id, uint8_t ok)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        if (g_modules[i]->id != id) continue;
+        module_state_t *st = &s_state[i];
+        st->last_use = hal_tick();
+        if (ok) {
+            st->use_count++;
+            st->err_count = 0;
+            if (st->lifecycle == LIFECYCLE_OPTIONAL)   /* OPTIONAL 可自复活 */
+                st->lifecycle = LIFECYCLE_ACTIVE;
+        } else {
+            st->err_count++;
+        }
+        return;
+    }
+}
+/* 回收：仅休眠/隔离态可回收，槽位释放可复用 */
+uint8_t module_recycle(uint8_t id)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        if (g_modules[i]->id != id) continue;
+        if (s_state[i].lifecycle == LIFECYCLE_ACTIVE) return 0;
+        s_state[i].lifecycle = LIFECYCLE_DELETED;
+        s_state[i].reusable = 1;
+        s_state[i].err_count = 0;
+        s_state[i].last_use = 0;
+        return 1;
+    }
+    return 0;
+}
+/* 退役：封存防复用（区别于回收——退役作废契约，回收归还资源） */
+uint8_t module_retire(uint8_t id)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        if (g_modules[i]->id != id) continue;
+        s_state[i].lifecycle = LIFECYCLE_DELETED;
+        s_state[i].reusable = 0;
+        return 1;
+    }
+    return 0;
+}
+/* 复活：休眠/隔离态回 ACTIVE（已回收的槽位不可复活） */
+uint8_t module_reactivate(uint8_t id)
+{
+    for (uint8_t i = 0; i < g_count; i++) {
+        if (g_modules[i]->id != id) continue;
+        if (s_state[i].reusable) return 0;
+        s_state[i].lifecycle = LIFECYCLE_ACTIVE;
+        s_state[i].last_use = hal_tick();
+        s_state[i].err_count = 0;
+        return 1;
+    }
+    return 0;
+}
+7. core/module_table.h
+C
+#ifndef MODULE_TABLE_H
+#define MODULE_TABLE_H
+#include "module.h"
+/* 节点模块表：第3参=方位（通用坐标；方位绑定语义只许在 app 层出现）。
+   模块 id 是节点内子地址；节点格址由 hal_node_slot() 给出。 */
+#define MODULE_TABLE(X) \
+    X( mod_acquire,       0, DIR_EAST,      DOMAIN_V, LAYER_NODE, LIFECYCLE_ACTIVE,   0x04U,       1, 0x1A2B3C4DU ) \
+    X( mod_digest,        1, DIR_EAST,      DOMAIN_H, LAYER_NODE, LIFECYCLE_ACTIVE,   0x08U,       1, 0x2B3C4D5EU ) \
+    X( mod_status,        2, DIR_EAST,      DOMAIN_E, LAYER_NODE, LIFECYCLE_ACTIVE,   0x08U,       1, 0x3C4D5E6FU ) \
+    X( mod_health,        3, DIR_EAST,      DOMAIN_F, LAYER_NODE, LIFECYCLE_ACTIVE,   0x08U,       1, 0x4D5E6F70U ) \
+    X( mod_extension,     4, DIR_SOUTH,     DOMAIN_X, LAYER_NODE, LIFECYCLE_OPTIONAL, 0x00U,       1, 0x5E6F7081U ) \
+    X( mod_class_register,5, DIR_SOUTHEAST, DOMAIN_H, LAYER_NODE, LIFECYCLE_OPTIONAL, 0x00010000U, 1, 0x6F708192U ) \
+    X( mod_intent_bus,    6, DIR_SOUTH,     DOMAIN_C, LAYER_NODE, LIFECYCLE_OPTIONAL, 0x00100000U, 1, 0x708193A4U )
+#endif
+8. core/input_pool.h
+C
+#ifndef CORE_INPUT_POOL_H
+#define CORE_INPUT_POOL_H
+#include <stdint.h>
+#define INPUT_POOL_CAP 16
+void    input_pool_reset(void);
+uint8_t input_pool_push(uint8_t v);
+uint8_t input_pool_len(void);
+uint8_t input_pool_get(uint8_t i);
+uint8_t input_pool_drop(void);   /* 溢出丢弃计数 */
+#endif
+9. core/input_pool.c
+C
+#include "input_pool.h"
+static uint8_t s_buf[INPUT_POOL_CAP];
+static uint8_t s_len = 0;
+static uint8_t s_drop = 0;
+void input_pool_reset(void)
+{
+    s_len = 0;
+    s_drop = 0;
+}
+uint8_t input_pool_push(uint8_t v)
+{
+    if (s_len >= INPUT_POOL_CAP) { s_drop++; return 0; }
+    s_buf[s_len++] = v;
+    return 1;
+}
+uint8_t input_pool_len(void) { return s_len; }
+uint8_t input_pool_get(uint8_t i) { return (i < s_len) ? s_buf[i] : 0; }
+uint8_t input_pool_drop(void) { return s_drop; }
+10. core/transport.h
+C
+#ifndef CORE_TRANSPORT_H
+#define CORE_TRANSPORT_H
+#include <stdint.h>
+#include "protocol.h"
+#define TR_KIND_CHAIN   0
+#define TR_KIND_STAR    1
+#define TR_KIND_SHARED  2
+void transport_init(uint8_t kind);
+void transport_forward(const uint8_t *buf, uint8_t len);
+#endif
+11. core/transport.c
+C
+#include "transport.h"
+#include "net.h"
+static uint8_t s_kind = TR_KIND_CHAIN;
+void transport_init(uint8_t kind)
+{
+    s_kind = kind;
+}
+void transport_forward(const uint8_t *buf, uint8_t len)
+{
+    frame_t f;
+    for (uint8_t i = 0; i < PROTO_ANSWER_LEN; i++)
+        f.raw[i] = (i < len) ? buf[i] : 0;
+    if (FTTL(&f) == 0) return;
+    f.q.ttl = (uint8_t)(FTTL(&f) - 1);
+    if (FTTL(&f) == 0) return;
+    switch (s_kind) {
+    case TR_KIND_STAR:
+    case TR_KIND_SHARED:
+    case TR_KIND_CHAIN:
+    default:
+        net_send(f.raw, len);
+        break;
+    }
+}
+12. core/net.h
+C
+#ifndef CORE_NET_H
+#define CORE_NET_H
+#include <stdint.h>
+#include "protocol.h"
+#define NET_CAP_ADDRESS  0x01U
+#define NET_CAP_INTENT   0x02U
+#define NET_CAP_RELIABLE 0x04U
+#define NET_CAP_ORDERED  0x08U
+typedef void (*net_handler_t)(const frame_t *f, uint8_t len);
+typedef struct {
+    uint8_t id;
+    uint8_t caps;
+    uint8_t (*init)(void);
+    uint8_t (*send)(const uint8_t *buf, uint8_t len);
+    uint8_t (*bind)(uint8_t intent_id, net_handler_t h);
+    uint8_t (*publish)(uint8_t intent_id, const uint8_t *buf, uint8_t len);
+    uint8_t (*poll)(uint8_t *buf, uint8_t *len);
+} net_provider_t;
+void net_init(void);
+uint8_t net_register(const net_provider_t *p);
+uint8_t net_probe(void);
+uint8_t net_supports(uint8_t cap);
+uint8_t net_select(uint8_t id);   /* 意图通道接入时经此切换提供者（预留接缝） */
+uint8_t net_send(const uint8_t *buf, uint8_t len);
+uint8_t net_bind(uint8_t intent_id, net_handler_t h);
+uint8_t net_publish(uint8_t intent_id, const uint8_t *buf, uint8_t len);
+uint8_t net_poll(uint8_t *buf, uint8_t *len);
+#endif
+13. core/net.c
+C
+#include "net.h"
+#define NET_PROVIDER_MAX 4
+static const net_provider_t *s_providers[NET_PROVIDER_MAX];
+static uint8_t s_count = 0;
+static uint8_t s_active = 0;
+void net_init(void)
+{
+    s_count = 0;
+    s_active = 0;
+}
+uint8_t net_register(const net_provider_t *p)
+{
+    if (s_count >= NET_PROVIDER_MAX) return 0;
+    s_providers[s_count++] = p;
+    return 1;
+}
+uint8_t net_probe(void)
+{
+    for (uint8_t i = 0; i < s_count; i++) {
+        if (s_providers[i]->caps & NET_CAP_ADDRESS) {
+            s_active = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+uint8_t net_supports(uint8_t cap)
+{
+    if (!s_providers[s_active]) return 0;
+    return (s_providers[s_active]->caps & cap) ? 1 : 0;
+}
+
+uint8_t net_select(uint8_t id)
+{
+    for (uint8_t i = 0; i < s_count; i++) {
+        if (s_providers[i]->id == id) {
+            s_active = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+uint8_t net_send(const uint8_t *buf, uint8_t len)
+{
+    if (!s_providers[s_active] || !s_providers[s_active]->send) return 0;
+    return s_providers[s_active]->send(buf, len);
+}
+uint8_t net_bind(uint8_t intent_id, net_handler_t h)
+{
+    if (!s_providers[s_active] || !s_providers[s_active]->bind) return 0;
+    return s_providers[s_active]->bind(intent_id, h);
+}
+uint8_t net_publish(uint8_t intent_id, const uint8_t *buf, uint8_t len)
+{
+    if (!s_providers[s_active] || !s_providers[s_active]->publish) return 0;
+    return s_providers[s_active]->publish(intent_id, buf, len);
+}
+uint8_t net_poll(uint8_t *buf, uint8_t *len)
+{
+    if (!s_providers[s_active] || !s_providers[s_active]->poll) return 0;
+    return s_providers[s_active]->poll(buf, len);
+}
+14. core/trust.h
+C
+#ifndef CORE_TRUST_H
+#define CORE_TRUST_H
+#include <stdint.h>
+#define TRUST_MAGIC 0x544E5254U
+typedef struct {
+    uint32_t magic;
+    uint32_t fw_hash;
+    uint16_t node_id;
+    uint16_t boot_count;
+    /* 预留：未来字段只追加在末尾，勿改既有偏移（flash 布局兼容）。 */
+} trust_blob_t;
+uint8_t          trust_verify(void);
+const uint32_t * trust_fw_hash(void);
+uint16_t         trust_boot_count(void);
+#endif
+15. core/trust.c
+C
+#include "trust.h"
+#include "config.h"
+/* 信任区（模拟 flash 独立分区；真实实现改为读写 flash 信任区） */
+static trust_blob_t s_blob = {
+    .magic      = TRUST_MAGIC,
+    .fw_hash    = 0x1A2B3C4DU,   /* 示例：固件镜像哈希，与 BUILD_VER 同步维护 */
+    .node_id    = CONFIG_NODE_SLOT,
+    .boot_count = 1,
+};
+uint8_t trust_verify(void)
+{
+    if (s_blob.magic != TRUST_MAGIC) return 0;        /* 信任区损坏/未初始化 */
+    if (s_blob.fw_hash != 0x1A2B3C4DU) return 0;      /* TODO: 对固件镜像实际哈希 */
+    if (s_blob.node_id != CONFIG_NODE_SLOT) return 0; /* 节点身份与配置不符 */
+    return 1;
+}
+const uint32_t * trust_fw_hash(void)
+{
+    return &s_blob.fw_hash;
+}
+uint16_t trust_boot_count(void)
+{
+    /* boot_count 由信任区写回流程维护（TODO：每次启动 +1 并写回 flash） */
+    return s_blob.boot_count;
+}
+16. core/kernel_main.c
+C
+#include "module.h"
+#include "net.h"
+#include "transport.h"
+#include "trust.h"
+#include "hal_port.h"
+#include "config.h"
+extern const net_provider_t net_prov_basic;
+extern const net_provider_t net_prov_intent;
+static frame_t s_tx;
+static void answer_whoami(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = CMD_WHOAMI;
+    tx->a.mod   = 0;
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.ttl   = CONFIG_NET_TTL;
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 1;
+    tx->a.data[0] = hal_node_slot();
+    tx->a.data[1] = (uint8_t)(trust_boot_count() >> 8);
+    tx->a.data[2] = (uint8_t)(trust_boot_count());
+    const uint32_t *h = trust_fw_hash();
+    tx->a.data[3] = (uint8_t)((h[0] >> 24) & 0xFF);
+    tx->a.data[4] = (uint8_t)((h[0] >> 16) & 0xFF);
+    tx->a.data[5] = (uint8_t)((h[0] >> 8) & 0xFF);
+    tx->a.data[6] = (uint8_t)(h[0] & 0xFF);
+}
+static void answer_modlist(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = CMD_MODLIST;
+    tx->a.mod   = 0;
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.ttl   = CONFIG_NET_TTL;
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 1;
+    tx->a.data[0] = module_manifest(&tx->a.data[1], 7);
+}
+int main(void)
+{
+    hal_init();
+    if (!trust_verify()) hal_halt();
+    transport_init(CONFIG_TRANSPORT_KIND);
+    net_init();
+    net_register(&net_prov_basic);
+    net_register(&net_prov_intent);
+    net_probe();
+    module_init_all();
+    frame_t rx;
+    uint8_t len;
+    for (;;) {
+        hal_sleep();
+        if (net_poll(rx.raw, &len)) {
+            if (!protocol_verify(rx.raw, len)) continue;
+            if (FDEST(&rx) == hal_node_slot()) {
+                frame_clear(&s_tx);
+                if (FCMD(&rx) == CMD_WHOAMI)       answer_whoami(&rx, &s_tx);
+                else if (FCMD(&rx) == CMD_MODLIST) answer_modlist(&rx, &s_tx);
+                else {
+                    module_dispatch_node(FMOD(&rx), &rx, &s_tx);
+                    s_tx.a.src = hal_node_slot();
+                }
+                s_tx.a.ttl = CONFIG_NET_TTL;
+                protocol_finalize_answer(&s_tx);
+                net_send(s_tx.raw, PROTO_ANSWER_LEN);
+            } else {
+                transport_forward(rx.raw, len);
+            }
+        }
+        module_poll_all();
+        hal_watchdog_kick();
+    }
+}
+17. hal/hal_port.h
+C
+#ifndef HAL_PORT_H
+#define HAL_PORT_H
+#include <stdint.h>
+void     hal_init(void);
+void     hal_sleep(void);
+void     hal_watchdog_kick(void);
+void     hal_halt(void);
+uint32_t hal_tick(void);
+uint8_t  hal_node_slot(void);
+uint8_t  hal_uart_read(uint8_t *b);
+void     hal_uart_write(uint8_t b);
+uint8_t  hal_uart_rx_pending(void);
+uint8_t  hal_adc_read(void);
+#endif
+18. hal/hal_mcu.c
+C
+/* 目标芯片实现槽（示例部署：CH32V003；换芯片只改本文件与 config，
+   核心层与协议层不依赖具体芯片——这是全包唯一的硬件绑定点）。 */
+#include "hal_port.h"
+#include "config.h"
+static uint32_t s_tick = 0;
+static uint8_t s_slot = CONFIG_NODE_SLOT;
+void hal_init(void)
+{
+    /* TODO: 时钟/GPIO/UART/ADC 初始化（寄存器级，依赖目标硬件原理图） */
+    s_slot = CONFIG_NODE_SLOT;
+}
+void hal_sleep(void)
+{
+    /* TODO: WFI 低功耗 */
+}
+void hal_watchdog_kick(void)
+{
+    /* TODO: 喂狗 */
+}
+void hal_halt(void)
+{
+    for (;;) { }
+}
+uint32_t hal_tick(void)
+{
+    /* TODO: 由 SysTick 中断累加。当前返回模拟 tick。 */
+    return s_tick++;
+}
+uint8_t hal_node_slot(void)
+{
+    return s_slot;
+}
+uint8_t hal_uart_read(uint8_t *b)
+{
+    (void)b;
+    return 0;   /* TODO: 读 UART */
+}
+void hal_uart_write(uint8_t b)
+{
+    (void)b;    /* TODO: 写 UART */
+}
+uint8_t hal_uart_rx_pending(void)
+{
+    return 0;   /* TODO: 查询 RX 就绪 */
+}
+uint8_t hal_adc_read(void)
+{
+    return 0;   /* TODO: 读 ADC */
+}
+19. modules/mod_acquire.c
+C
+#include "module.h"
+#include "hal_port.h"
+#include "input_pool.h"
+static uint8_t s_duty = 8;
+static uint8_t s_cnt = 0;
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+    if (FCMD(rx) == CMD_START) {
+        if (FPARAM(rx, 0) != 0) s_duty = FPARAM(rx, 0);
+        input_pool_reset();
+        tx->a.ack = 1;
+    }
+}
+static void poll(void)
+{
+    if (++s_cnt < s_duty) return;
+    s_cnt = 0;
+    input_pool_push(hal_adc_read());
+}
+const module_t mod_acquire = {
+    .id = 0,
+    .group = DIR_EAST,
+    .domain = DOMAIN_V,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_ACTIVE,
+    .perm = 0x04U,          /* START(0x02)：1<<2 */
+    .api_version = 1,
+    .contract_hash = 0x1A2B3C4DU,
+    .init = 0,
+    .poll = poll,
+    .on_cmd = on_cmd,
+};
+20. modules/mod_digest.c
+C
+#include "module.h"
+#include "hal_port.h"
+#include "input_pool.h"
+#include "signature.h"
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+    if (FCMD(rx) == CMD_STATUS) {
+        uint8_t n = input_pool_len();
+        signature_t sig;
+        signature_clear(&sig);
+        sig.domain = DOMAIN_H;
+        sig.period = PERIOD_M7;   /* 验证类 */
+        sig.type   = 0;
+        sig.confidence = 0;
+        sig.direction = SLOT_DIR(hal_node_slot());  /* 签名携带本节点格址：方位 */
+        sig.verb      = SLOT_VERB(hal_node_slot()); /* 签名携带本节点格址：动词序号 */
+        sig.len = n;
+        for (uint8_t i = 0; i < n; i++) sig.data[i] = input_pool_get(i);
+        uint32_t h = signature_hash(&sig);
+        tx->a.data[0] = (uint8_t)(h >> 24);
+        tx->a.data[1] = (uint8_t)(h >> 16);
+        tx->a.data[2] = (uint8_t)(h >> 8);
+        tx->a.data[3] = (uint8_t)(h);
+        tx->a.data[4] = input_pool_drop();   /* 溢出诊断 */
+        tx->a.ack = 2;
+    }
+}
+const module_t mod_digest = {
+    .id = 1,
+    .group = DIR_EAST,
+    .domain = DOMAIN_H,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_ACTIVE,
+    .perm = 0x08U,          /* STATUS(0x03)：1<<3 */
+    .api_version = 1,
+    .contract_hash = 0x2B3C4D5EU,
+    .init = 0,
+    .poll = 0,
+    .on_cmd = on_cmd,
+};
+21. modules/mod_status.c
+C
+#include "module.h"
+#include "hal_port.h"
+static uint32_t s_uptime = 0;
+static void poll(void)
+{
+    s_uptime++;
+}
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+    if (FCMD(rx) == CMD_STATUS) {
+        tx->a.data[0] = (uint8_t)(s_uptime >> 24);
+        tx->a.data[1] = (uint8_t)(s_uptime >> 16);
+        tx->a.data[2] = (uint8_t)(s_uptime >> 8);
+        tx->a.data[3] = (uint8_t)(s_uptime);
+        tx->a.data[4] = hal_node_slot();
+        tx->a.ack = 1;
+    }
+}
+const module_t mod_status = {
+    .id = 2,
+    .group = DIR_EAST,
+    .domain = DOMAIN_E,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_ACTIVE,
+    .perm = 0x08U,          /* STATUS(0x03)：1<<3 */
+    .api_version = 1,
+    .contract_hash = 0x3C4D5E6FU,
+    .init = 0,
+    .poll = poll,
+    .on_cmd = on_cmd,
+};
+22. modules/mod_health.c
+C
+#include "module.h"
+#include "hal_port.h"
+static uint8_t s_fail = 0;
+static void poll(void)
+{
+    if (hal_adc_read() == 0xFFU) {   /* 自检失败 */
+        s_fail++;
+        module_report(3, 0);
+    } else {
+        module_report(3, 1);
+    }
+}
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+    if (FCMD(rx) == CMD_STATUS) {
+        tx->a.data[0] = s_fail;
+        tx->a.ack = 1;
+    }
+}
+const module_t mod_health = {
+    .id = 3,
+    .group = DIR_EAST,
+    .domain = DOMAIN_F,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_ACTIVE,
+    .perm = 0x08U,          /* STATUS(0x03)：1<<3 */
+    .api_version = 1,
+    .contract_hash = 0x4D5E6F70U,
+    .init = 0,
+    .poll = poll,
+    .on_cmd = on_cmd,
+};
+23. modules/mod_extension.c
+C
+#include "module.h"
+#include "hal_port.h"
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+}
+const module_t mod_extension = {
+    .id = 4,
+    .group = DIR_SOUTH,
+    .domain = DOMAIN_X,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_OPTIONAL,
+    .perm = 0x00U,
+    .api_version = 1,
+    .contract_hash = 0x5E6F7081U,
+    .init = 0,
+    .poll = 0,
+    .on_cmd = on_cmd,
+};
+24. net/net_prov_basic.c
+C
+#include "net.h"
+#include "protocol.h"
+#define PROV_BASIC_ID   1
+#define PROV_BUF_N      4
+#define PROV_BUF_LEN    45
+static uint8_t s_ring[PROV_BUF_N][PROV_BUF_LEN];
+static uint8_t s_len[PROV_BUF_N];
+static uint8_t s_head = 0, s_tail = 0, s_n = 0;
+static uint8_t basic_init(void)
+{
+    s_head = s_tail = s_n = 0;
+    return 1;
+}
+static uint8_t basic_send(const uint8_t *buf, uint8_t len)
+{
+    if (len > PROV_BUF_LEN) return 0;
+    if (s_n >= PROV_BUF_N) return 0;
+    for (uint8_t i = 0; i < PROV_BUF_LEN; i++)
+        s_ring[s_head][i] = (i < len) ? buf[i] : 0;
+    s_len[s_head] = len;
+    s_head = (uint8_t)((s_head + 1) % PROV_BUF_N);
+    s_n++;
+    return 1;
+}
+static uint8_t basic_bind(uint8_t intent_id, net_handler_t h)
+{
+    (void)intent_id; (void)h;
+    return 0;   /* 基本提供者不支持订阅 */
+}
+static uint8_t basic_publish(uint8_t intent_id, const uint8_t *buf, uint8_t len)
+{
+    (void)intent_id;
+    return basic_send(buf, len);
+}
+static uint8_t basic_poll(uint8_t *buf, uint8_t *len)
+{
+    if (s_n == 0) return 0;
+    for (uint8_t i = 0; i < PROV_BUF_LEN; i++)
+        buf[i] = s_ring[s_tail][i];
+    *len = s_len[s_tail];
+    s_tail = (uint8_t)((s_tail + 1) % PROV_BUF_N);
+    s_n--;
+    return 1;
+}
+const net_provider_t net_prov_basic = {
+    .id = PROV_BASIC_ID,
+    .caps = NET_CAP_ADDRESS | NET_CAP_RELIABLE | NET_CAP_ORDERED,
+    .init = basic_init,
+    .send = basic_send,
+    .bind = basic_bind,
+    .publish = basic_publish,
+    .poll = basic_poll,
+};
+25. net/net_prov_intent.c
+C
+#include "net.h"
+#include "protocol.h"
+#define PROV_INTENT_ID 2
+static uint8_t intent_init(void) { return 1; }
+static uint8_t intent_send(const uint8_t *buf, uint8_t len)
+{
+    (void)buf; (void)len;
+    return 0;   /* 载体未就绪（预留接缝） */
+}
+static uint8_t intent_bind(uint8_t intent_id, net_handler_t h)
+{
+    (void)intent_id; (void)h;
+    return 0;   /* 载体未就绪 */
+}
+static uint8_t intent_publish(uint8_t intent_id, const uint8_t *buf, uint8_t len)
+{
+    (void)intent_id; (void)buf; (void)len;
+    return 0;
+}
+static uint8_t intent_poll(uint8_t *buf, uint8_t *len)
+{
+    (void)buf; (void)len;
+    return 0;
+}
+const net_provider_t net_prov_intent = {
+    .id = PROV_INTENT_ID,
+    .caps = NET_CAP_INTENT,
+    .init = intent_init,
+    .send = intent_send,
+    .bind = intent_bind,
+    .publish = intent_publish,
+    .poll = intent_poll,
+};
+26. master/master_main.c
+C
+#include "module.h"
+#include "net.h"
+#include "transport.h"
+#include "hal_port.h"
+#include "master_parser.h"
+#include "config.h"
+extern const net_provider_t net_prov_basic;
+extern const net_provider_t net_prov_intent;
+int main(void)
+{
+    hal_init();
+    transport_init(CONFIG_TRANSPORT_KIND);
+    net_init();
+    net_register(&net_prov_basic);
+    net_register(&net_prov_intent);
+    net_probe();
+    module_init_all();
+    master_parser_init();
+    frame_t rx;
+    uint8_t len;
+    for (;;) {
+        master_parser_poll();
+        module_poll_all();
+        if (net_poll(rx.raw, &len)) {
+            if (!protocol_verify(rx.raw, len)) continue;
+            if (FCMD(&rx) == CMD_WHOAMI || FCMD(&rx) == CMD_MODLIST) {
+                master_parser_consume(&rx);
+                continue;
+            }
+            frame_t tx;
+            module_dispatch_master(FSRC(&rx), &rx, &tx);
+        }
+        hal_watchdog_kick();
+    }
+}
+27. master/master_parser.h
+C
+#ifndef MASTER_PARSER_H
+#define MASTER_PARSER_H
+#include <stdint.h>
+#include "protocol.h"
+#define P_TIMEOUT   200U
+#define P_MAX_RETRY 3U
+typedef enum { P_UNKNOWN, P_PENDING, P_READY, P_LOST } node_state_t;
+typedef struct {
+    uint8_t  slot;
+    uint8_t  state;
+    uint8_t  mod_listed;    /* 清单已取 */
+    uint8_t  mod_count;     /* 模块数 */
+    uint32_t fw_hash;
+    uint8_t  retries;
+    uint32_t t_sent;
+} node_entry_t;
+void master_parser_init(void);
+void master_parser_poll(void);
+uint8_t master_parser_consume(const frame_t *ans);
+const node_entry_t *master_parser_get(uint8_t slot);
+#endif
+28. master/master_parser.c
+C
+#include "master_parser.h"
+#include "net.h"
+#include "hal_port.h"
+#include "module.h"
+#include "config.h"
+static node_entry_t s_nodes[SLOT_COUNT];
+static uint8_t s_scan = 0;
+static uint8_t s_seq = 0;
+static void send_q(uint8_t slot, uint8_t cmd)
+{
+    frame_t q;
+    q.q.magic = FRAME_MAGIC;
+    q.q.cmd   = cmd;
+    q.q.mod   = 0;
+    q.q.dest  = slot;
+    q.q.src   = CONFIG_MASTER_SLOT;
+    q.q.ttl   = CONFIG_NET_TTL;
+    q.q.seq   = ++s_seq;
+    q.q.ack   = 0;
+    q.q.param[0] = q.q.param[1] = q.q.param[2] = q.q.param[3] = 0;
+    protocol_finalize_query(&q);
+    net_send(q.raw, PROTO_QUERY_LEN);
+    s_nodes[slot].t_sent = hal_tick();
+}
+void master_parser_init(void)
+{
+    for (uint8_t i = 0; i < SLOT_COUNT; i++) {
+        s_nodes[i].slot = i;
+        s_nodes[i].state = P_UNKNOWN;
+        s_nodes[i].mod_listed = 0;
+        s_nodes[i].mod_count = 0;
+        s_nodes[i].retries = 0;
+        s_nodes[i].t_sent = 0;
+    }
+}
+void master_parser_poll(void)
+{
+    uint32_t now = hal_tick();
+    static uint32_t t_scan = 0;
+    if ((now - t_scan) < 50) return;
+    t_scan = now;
+    /* 1) 超时重试 */
+    for (uint8_t i = 0; i < SLOT_COUNT; i++) {
+        if (s_nodes[i].state == P_PENDING && (now - s_nodes[i].t_sent) > P_TIMEOUT) {
+            if (++s_nodes[i].retries >= P_MAX_RETRY) {
+                s_nodes[i].state = P_LOST;
+                continue;
+            }
+            send_q(i, CMD_WHOAMI);
+            return;
+        }
+    }
+    /* 2) 扫描未发现槽位（跳过 master 自身槽位） */
+    for (uint8_t n = 0; n < SLOT_COUNT; n++) {
+        uint8_t i = (uint8_t)((s_scan + n) & (SLOT_COUNT - 1));
+        if (i == CONFIG_MASTER_SLOT) continue;
+        if (s_nodes[i].state == P_UNKNOWN || s_nodes[i].state == P_LOST) {
+            s_scan = (uint8_t)((i + 1) & (SLOT_COUNT - 1));
+            send_q(i, CMD_WHOAMI);
+            return;
+        }
+    }
+    /* 3) 点验：已发现未取清单 */
+    for (uint8_t i = 0; i < SLOT_COUNT; i++) {
+        if (s_nodes[i].state == P_READY && !s_nodes[i].mod_listed) {
+            send_q(i, CMD_MODLIST);
+            return;
+        }
+    }
+}
+uint8_t master_parser_consume(const frame_t *ans)
+{
+    uint8_t s = FSRC(ans);
+    if (s >= SLOT_COUNT) return 0;
+    node_entry_t *e = &s_nodes[s];
+    if (FCMD(ans) == CMD_WHOAMI) {
+        e->slot = s;
+        e->state = P_READY;
+        e->fw_hash = ((uint32_t)ans->a.data[3] << 24) |
+                     ((uint32_t)ans->a.data[4] << 16) |
+                     ((uint32_t)ans->a.data[5] << 8)  |
+                     ans->a.data[6];
+        e->retries = 0;
+        e->mod_listed = 0;
+        e->mod_count = 0;
+        return 1;
+    }
+    if (FCMD(ans) == CMD_MODLIST) {
+        if (e->state != P_READY) return 0;
+        e->mod_listed = 1;
+        e->mod_count = ans->a.data[0];
+        return 1;
+    }
+    return 0;
+}
+const node_entry_t *master_parser_get(uint8_t slot)
+{
+    return (slot < SLOT_COUNT) ? &s_nodes[slot] : 0;
+}
+29. master/master_module_table.h
+C
+#ifndef MODULE_TABLE_H
+#define MODULE_TABLE_H
+#include "module.h"
+#define MODULE_TABLE(X) \
+    X( mod_control, 0, DIR_EAST, DOMAIN_C, LAYER_MASTER, LIFECYCLE_ACTIVE, 0x08U, 1, 0x99AABBCCU )
+#endif
+30. master/mod_control.c
+C
+#include "module.h"
+#include "net.h"
+#include "hal_port.h"
+#include "master_parser.h"
+#include "config.h"
+static uint8_t s_seq = 0, s_pos = 0;
+static uint8_t s_pend[32];
+static uint8_t s_pend_n = 0;
+static void send_cmd(uint8_t slot, uint8_t cmd, uint8_t mod)
+{
+    frame_t q;
+    q.q.magic = FRAME_MAGIC;
+    q.q.cmd   = cmd;
+    q.q.mod   = mod;
+    q.q.dest  = slot;
+    q.q.src   = CONFIG_MASTER_SLOT;
+    q.q.ttl   = CONFIG_NET_TTL;
+    q.q.seq   = ++s_seq;
+    q.q.ack   = 0;
+    q.q.param[0] = 8;
+    q.q.param[1] = q.q.param[2] = q.q.param[3] = 0;
+    protocol_finalize_query(&q);
+    net_send(q.raw, PROTO_QUERY_LEN);
+}
+static void poll(void)
+{
+    static uint32_t t = 0;
+    uint32_t now = hal_tick();
+    if ((now - t) < 200) return;
+    t = now;
+    for (uint8_t n = 0; n < SLOT_COUNT && s_pos < SLOT_COUNT; n++) {
+        uint8_t slot = s_pos++;
+        const node_entry_t *e = master_parser_get(slot);
+        if (e && e->state == P_READY) {
+            send_cmd(slot, CMD_START,  0);
+            send_cmd(slot, CMD_STATUS, 1);
+            send_cmd(slot, CMD_STATUS, 2);   /* 否则被老化回收 */
+            send_cmd(slot, CMD_STATUS, 3);   /* 否则被老化回收 */
+            return;
+        }
+    }
+    /* TODO: 经宿主接口上报 s_pend */
+}
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    (void)tx;
+    if (FCMD(rx) == CMD_STATUS) {
+        for (uint8_t i = 0; i < 32; i++) s_pend[i] = FDATA(rx, i);
+        s_pend_n = 1;
+    }
+}
+const module_t mod_control = {
+    .id = 0,
+    .group = DIR_EAST,
+    .domain = DOMAIN_C,
+    .layer = LAYER_MASTER,
+    .lifecycle = LIFECYCLE_ACTIVE,
+    .perm = 0x08U,          /* STATUS(0x03)：1<<3 */
+    .api_version = 1,
+    .contract_hash = 0x99AABBCCU,
+    .init = 0,
+    .poll = poll,
+    .on_cmd = on_cmd,
+};
+31. host/host_main.c
+C
+#include "module.h"
+#include "hal_port.h"
+/* host 四模块：契约桩（数据通道未来接入） */
+static void stub_poll(void) { }
+static void stub_on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = 0;
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+}
+const module_t mod_filter = {
+    .id = 0, .group = DIR_EAST, .domain = DOMAIN_H, .layer = LAYER_HOST,
+    .lifecycle = LIFECYCLE_OPTIONAL, .perm = 0x00U,
+    .api_version = 1, .contract_hash = 0x11111111U,
+    .init = 0, .poll = stub_poll, .on_cmd = stub_on_cmd,
+};
+const module_t mod_correlate = {
+    .id = 1, .group = DIR_EAST, .domain = DOMAIN_R, .layer = LAYER_HOST,
+    .lifecycle = LIFECYCLE_OPTIONAL, .perm = 0x00U,
+    .api_version = 1, .contract_hash = 0x22222222U,
+    .init = 0, .poll = stub_poll, .on_cmd = stub_on_cmd,
+};
+const module_t mod_store = {
+    .id = 2, .group = DIR_EAST, .domain = DOMAIN_F, .layer = LAYER_HOST,
+    .lifecycle = LIFECYCLE_OPTIONAL, .perm = 0x00U,
+    .api_version = 1, .contract_hash = 0x33333333U,
+    .init = 0, .poll = stub_poll, .on_cmd = stub_on_cmd,
+};
+const module_t mod_render = {
+    .id = 3, .group = DIR_EAST, .domain = DOMAIN_K, .layer = LAYER_HOST,
+    .lifecycle = LIFECYCLE_OPTIONAL, .perm = 0x00U,
+    .api_version = 1, .contract_hash = 0x44444444U,
+    .init = 0, .poll = stub_poll, .on_cmd = stub_on_cmd,
+};
+int main(void)
+{
+    hal_init();
+    module_init_all();
+    for (;;) {
+        module_poll_all();
+        hal_watchdog_kick();
+    }
+}
+32. host/host_module_table.h
+C
+#ifndef MODULE_TABLE_H
+#define MODULE_TABLE_H
+#include "module.h"
+#define MODULE_TABLE(X) \
+    X( mod_filter,    0, DIR_EAST, DOMAIN_H, LAYER_HOST, LIFECYCLE_OPTIONAL, 0x00U, 1, 0x11111111U ) \
+    X( mod_correlate, 1, DIR_EAST, DOMAIN_R, LAYER_HOST, LIFECYCLE_OPTIONAL, 0x00U, 1, 0x22222222U ) \
+    X( mod_store,     2, DIR_EAST, DOMAIN_F, LAYER_HOST, LIFECYCLE_OPTIONAL, 0x00U, 1, 0x33333333U ) \
+    X( mod_render,    3, DIR_EAST, DOMAIN_K, LAYER_HOST, LIFECYCLE_OPTIONAL, 0x00U, 1, 0x44444444U )
+#endif
+33. app/map_slot_label.c
+C
+#include <stdint.h>
+#include "cell.h"
+
+/* 领域数据唯一合法入口（规则：领域数据只进 app/）。
+ * 本文件 = 「通用坐标 → 部署命名」的唯一绑定层：
+ * 核心层只认 (方位, 动词序号) 整数；叫什么名字、对应什么部署语义，全在此处。
+ * 换部署时只改本文件（唯一绑定层），核心层一字不动。 */
+
+typedef struct {
+    uint8_t     dir;
+    const char *label_cn;
+    const char *label_en;
+} dir_name_t;
+
+static const dir_name_t s_dir_names[] = {
+    { DIR_EAST,      "东",   "EAST"  },
+    { DIR_SOUTHEAST, "东南", "SE"    },
+    { DIR_SOUTH,     "南",   "SOUTH" },
+    { DIR_SOUTHWEST, "西南", "SW"    },
+    { DIR_WEST,      "西",   "WEST"  },
+    { DIR_NORTHWEST, "西北", "NW"    },
+    { DIR_NORTH,     "北",   "NORTH" },
+    { DIR_NORTHEAST, "东北", "NE"    },
+};
+
+typedef struct {
+    uint8_t     verb;
+    const char *label_cn;
+} verb_name_t;
+
+static const verb_name_t s_verb_names[] = {
+    { VERB_OVERWRITE,  "覆盖" },
+    { VERB_QUERY,      "查询" },
+    { VERB_EXPAND,     "展开" },
+    { VERB_CONTRACT,   "收束" },
+    { VERB_PROPOSE,    "提出" },
+    { VERB_VERIFY,     "验证" },
+    { VERB_ADJUDICATE, "裁决" },
+    { VERB_WRITE,      "写入" },
+};
+
+/* 方位中文名（内部 0 起头 → 查表；越界返回 0） */
+const char *map_dir_label(uint8_t dir)
+{
+    for (uint8_t i = 0; i < sizeof(s_dir_names) / sizeof(s_dir_names[0]); i++)
+        if (s_dir_names[i].dir == dir) return s_dir_names[i].label_cn;
+    return 0;
+}
+
+/* 动词序号中文名 */
+const char *map_verb_label(uint8_t verb)
+{
+    for (uint8_t i = 0; i < sizeof(s_verb_names) / sizeof(s_verb_names[0]); i++)
+        if (s_verb_names[i].verb == verb) return s_verb_names[i].label_cn;
+    return 0;
+}
+
+/* 通用格址标签："DD-VV"（展示层 01 起头），如槽位 0x0A=(东南,展开) → "02-03"。
+ * 纯手工拼串，不依赖 stdio。越界返回 0。 */
+const char *map_slot_label(uint8_t slot)
+{
+    static char buf[8];
+    uint8_t d = CELL_DIR_DISPLAY(SLOT_DIR(slot));
+    uint8_t v = CELL_VERB_DISPLAY(SLOT_VERB(slot));
+    if (d > 8U || v > 8U) return 0;
+    buf[0] = (char)('0' + (d / 10));
+    buf[1] = (char)('0' + (d % 10));
+    buf[2] = '-';
+    buf[3] = (char)('0' + (v / 10));
+    buf[4] = (char)('0' + (v % 10));
+    buf[5] = '\0';
+    return buf;
+}
+
+
+
+34. modules/mod_class_register.c
+
+C
+
+#include "module.h"
+#include "hal_port.h"
+
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+
+    if (FCMD(rx) == CMD_CLASS) {
+        uint8_t domain = FPARAM(rx, 0);
+        uint8_t n;
+
+        if (domain == 0xFFU)
+            n = module_manifest(&tx->a.data[1], 7);
+        else
+            n = module_manifest_domain(domain, &tx->a.data[1], 7);
+
+        tx->a.data[0] = n;
+        tx->a.ack = 1;
+    }
+}
+
+const module_t mod_class_register = {
+    .id = 5,
+    .group = DIR_SOUTHEAST,
+    .domain = DOMAIN_H,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_OPTIONAL,
+    .perm = 0x00010000U,    /* CLASS(0x10)：1<<16 */
+    .api_version = 1,
+    .contract_hash = 0x6F708192U,
+    .init = 0,
+    .poll = 0,
+    .on_cmd = on_cmd,
+};
+
+35. modules/mod_intent_bus.c
+
+C
+
+#include "module.h"
+#include "net.h"
+#include "hal_port.h"
+
+static void on_cmd(const frame_t *rx, frame_t *tx)
+{
+    tx->a.magic = FRAME_MAGIC;
+    tx->a.cmd   = FCMD(rx);
+    tx->a.mod   = FMOD(rx);
+    tx->a.dest  = FSRC(rx);
+    tx->a.src   = hal_node_slot();
+    tx->a.seq   = FSEQ(rx);
+    tx->a.ack   = 0;
+
+    if (FCMD(rx) == CMD_INTENT) {
+        uint8_t intent_id = FPARAM(rx, 0);
+
+        /* 只做转发，不做决策；订阅方自行处理。
+           仅当当前网络提供者真正支持意图通道时才转发，
+           避免基础队列提供者把命令原样回环成死循环。 */
+        if (net_supports(NET_CAP_INTENT) &&
+            net_publish(intent_id, rx->raw, PROTO_QUERY_LEN))
+            tx->a.ack = 1;
+    }
+}
+
+const module_t mod_intent_bus = {
+    .id = 6,
+    .group = DIR_SOUTH,
+    .domain = DOMAIN_C,
+    .layer = LAYER_NODE,
+    .lifecycle = LIFECYCLE_OPTIONAL,
+    .perm = 0x00100000U,    /* INTENT(0x14)：1<<20 */
+    .api_version = 1,
+    .contract_hash = 0x708193A4U,
+    .init = 0,
+    .poll = 0,
+    .on_cmd = on_cmd,
+};
+
+36. core/signature.h
+
+C
+
+#ifndef CORE_SIGNATURE_H
+#define CORE_SIGNATURE_H
+
+#include <stdint.h>
+#include "protocol.h"
+#include "cell.h"   /* direction_t / verb_t：签名与意图事件携带格址坐标 */
+
+#define SIGNATURE_MAX_DATA 32U
+#define INTENT_PARAM_COUNT 4U
+
+/* 机制周期：M1-M12 是操作的类型轴（本体分类：这个操作是什么），
+   与 状态域(在哪)、方位(哪个方向)、动词序号(怎么执行) 正交独立。
+   完整格址 = 状态域(12) × 周期(12) × 方位(8) × 动词(8) = 9216；
+   域与周期为语义维度，随签名/意图携带，不占槽位地址。
+   周期可添加（新增须经审议）。
+   注意：动词"验证"与周期"验证类"为同形异义——动词是执行动作，
+   周期是操作类型，二者正交，不因同名而等同。 */
+typedef enum {
+    PERIOD_NONE = 0,
+    PERIOD_M1 = 1,  /* 建立类 */
+    PERIOD_M2,      /* 撤销类 */
+    PERIOD_M3,      /* 改写类 */
+    PERIOD_M4,      /* 转流类 */
+    PERIOD_M5,      /* 重构类 */
+    PERIOD_M6,      /* 体验类 */
+    PERIOD_M7,      /* 验证类 */
+    PERIOD_M8,      /* 构想类 */
+    PERIOD_M9,      /* 锚定类 */
+    PERIOD_M10,     /* 镜映类 */
+    PERIOD_M11,     /* 学习类 */
+    PERIOD_M12      /* 双向类 */
+} mechanism_period_t;
+
+/* 通用信号签名：用于承载输入摘要、身份签名、意图签名等。 */
+typedef struct {
+    uint32_t id;
+    uint8_t  domain;
+    uint8_t  period;
+    uint8_t  type;
+    uint8_t  confidence;
+    uint8_t  len;
+    uint8_t  data[SIGNATURE_MAX_DATA];
+    /* 追加字段（append-only，勿改既有偏移）：格址坐标，与 SLOT_DIR/SLOT_VERB 一致 */
+    uint8_t  direction;   /* 方位（格址高3位） */
+    uint8_t  verb;        /* 动词序号（格址低3位） */
+} signature_t;
+
+/* 通用意图事件：上层只声明“想做什么”，由订阅方决定如何执行。 */
+typedef struct {
+    uint32_t seq;
+    uint8_t  intent_id;
+    uint8_t  domain;
+    uint8_t  period;
+    uint8_t  priority;
+    uint8_t  param[INTENT_PARAM_COUNT];
+    /* 追加字段（append-only）：格址坐标 */
+    uint8_t  direction;   /* 方位 */
+    uint8_t  verb;        /* 动词序号 */
+} intent_event_t;
+
+void    signature_clear(signature_t *s);
+uint8_t signature_set(signature_t *s, uint32_t id, uint8_t domain,
+                      uint8_t type, const uint8_t *data, uint8_t len);
+uint32_t signature_hash(const signature_t *s);
+void    intent_event_clear(intent_event_t *e);
+
+#endif
+
+37. core/signature.c
+
+C
+
+#include "signature.h"
+#include "config.h"
+
+void signature_clear(signature_t *s)
+{
+    if (!s) return;
+    s->id = 0;
+    s->domain = 0;
+    s->period = 0;
+    s->type = 0;
+    s->confidence = 0;
+    s->len = 0;
+    s->direction = 0;
+    s->verb = 0;
+    for (uint8_t i = 0; i < SIGNATURE_MAX_DATA; i++)
+        s->data[i] = 0;
+}
+
+uint8_t signature_set(signature_t *s, uint32_t id, uint8_t domain,
+                      uint8_t type, const uint8_t *data, uint8_t len)
+{
+    if (!s || !data || len > SIGNATURE_MAX_DATA) return 0;
+    signature_clear(s);
+    s->id = id;
+    s->domain = domain;
+    s->type = type;
+    s->len = len;
+    for (uint8_t i = 0; i < len; i++)
+        s->data[i] = data[i];
+    return 1;
+}
+
+uint32_t signature_hash(const signature_t *s)
+{
+    uint8_t tmp[4 + 5 + SIGNATURE_MAX_DATA + 2];   /* +2：格址坐标（追加字段） */
+    uint8_t n = 0;
+
+    if (!s) return 0;
+    tmp[n++] = (uint8_t)(s->id >> 24);
+    tmp[n++] = (uint8_t)(s->id >> 16);
+    tmp[n++] = (uint8_t)(s->id >> 8);
+    tmp[n++] = (uint8_t)(s->id);
+    tmp[n++] = s->domain;
+    tmp[n++] = s->period;
+    tmp[n++] = s->type;
+    tmp[n++] = s->confidence;
+    tmp[n++] = s->len;
+    for (uint8_t i = 0; i < s->len; i++)
+        tmp[n++] = s->data[i];
+    /* 追加字段：方位、动词序号（保持既有序列化顺序不变，只追加在末尾） */
+    tmp[n++] = s->direction;
+    tmp[n++] = s->verb;
+    return protocol_hash32_algo(CONFIG_HASH_ALGO, tmp, n);
+}
+
+void intent_event_clear(intent_event_t *e)
+{
+    if (!e) return;
+    e->seq = 0;
+    e->intent_id = 0;
+    e->domain = 0;
+    e->period = 0;
+    e->priority = 0;
+    e->direction = 0;
+    e->verb = 0;
+    for (uint8_t i = 0; i < INTENT_PARAM_COUNT; i++)
+        e->param[i] = 0;
+}
+
+38. core/cell.h
+C
+#ifndef CORE_CELL_H
+#define CORE_CELL_H
+#include <stdint.h>
+
+/* ============================================================================
+ * 通用格址坐标系统（Universal Cell Coordinate System）
+ * cell_id = 状态域(DOMAIN) + M周期(PERIOD) + 方位(DIRECTION) + 动词序号(VERB)
+ * 核心层只定义坐标与寻址，不做任何物理、几何或领域声明；
+ * 命名与通道绑定只存在于 app 层。
+ * ============================================================================ */
+
+/* 方位：8 个，刚性不可扩展（3 位地址容量）。内部 0 起头，对外 01..08。 */
+typedef enum {
+    DIR_EAST = 0,      /* 01 东   —— 起点 */
+    DIR_SOUTHEAST,     /* 02 东南 */
+    DIR_SOUTH,         /* 03 南   */
+    DIR_SOUTHWEST,     /* 04 西南 */
+    DIR_WEST,          /* 05 西   */
+    DIR_NORTHWEST,     /* 06 西北 */
+    DIR_NORTH,         /* 07 北   */
+    DIR_NORTHEAST,     /* 08 东北 */
+    DIR_COUNT = 8
+} direction_t;
+
+/* 动词序号：基础 8 个根操作；可审议扩展为注册 ID（VERB_EXTENDED_MIN..VERB_MAX），
+ * 扩展动词仅存于签名/意图，不占槽位地址。
+ * 动词是执行动作轴，与周期(操作类型轴)正交——"验证"与周期"验证类"同名，
+ * 系同形异义，不代表同一语义。 */
+typedef enum {
+    VERB_OVERWRITE = 0,  /* 01 覆盖 —— 以新态覆盖旧态 */
+    VERB_QUERY,          /* 02 查询 —— 读取当前态 */
+    VERB_EXPAND,         /* 03 展开 —— 开放/细化 */
+    VERB_CONTRACT,       /* 04 收束 —— 收敛/封存 */
+    VERB_PROPOSE,        /* 05 提出 —— 提交待决 */
+    VERB_VERIFY,         /* 06 验证 —— 校验一致性 */
+    VERB_ADJUDICATE,     /* 07 裁决 —— 定夺优先级 */
+    VERB_WRITE,          /* 08 写入 —— 固化落地 */
+    VERB_COUNT = 8,      /* 基础集大小 */
+    VERB_EXTENDED_MIN = 8,   /* 扩展动词 ID 起点 */
+    VERB_MAX = 255           /* 动词 ID 上限（uint8_t） */
+} verb_t;
+
+/* 格址编码：8×8 = 64 槽。高3位=方位，低3位=动词序号。
+ * 槽位是节点的物理地址：一个节点 = (方位, 动词序号) 的一个格子。 */
+#define SLOT_COUNT   64U
+#define SLOT_MAKE(d, v)  (((uint8_t)(((d) & 0x07U) << 3) | ((v) & 0x07U)))
+#define SLOT_DIR(s)      ((uint8_t)((s) >> 3))
+#define SLOT_VERB(s)     ((uint8_t)((s) & 0x07U))
+
+/* 展示层起头换算：内部 0 起头 → 对外 01 起头（只许展示层调用）。 */
+#define CELL_DIR_DISPLAY(d)   ((uint8_t)((d) + 1U))
+#define CELL_VERB_DISPLAY(v)  ((uint8_t)((v) + 1U))
+
+#endif
+
+
+
+一个可能的猜测是：脑机接口的研究方向或许与《崩坏：星穹铁道》中的“联觉信标”功能存在相似之处，其底层实现可能依托于中医“五脏六腑之精气，皆上注于目而为之精”的理论框架。先天性盲人梦中出现图像的实验提示，眼睛可能是人体空间定位的基准性方位对齐工具；橡胶手错觉实验也能为此提供佐证。在原理层面，五识负责接收原始信号，可视为质检意义上的“太素”；传输链路负责标准化搬运，对应原料意义上的“太初”；五行状态并非静态标签，而是一套动态的生克逻辑，属于分类层面的“太始”与太极算法的结合——其中“相生”用于处理语义递进，“相克”用于识别反义与冲突，“反克”用于纠错逻辑悖论。当系统遇到无法解析的“道性”内容时，则触发降级协议，将语义坍缩为意象或韵律。由此推测，太极算法可能既是静态核心，也是动态推演机制。
+
+金子可能具有特殊功能，制造替代品至少需要高等文明水平才能研发，并可能存在非本地化的兼容性问题。
+
+从结构信息看，符箓用朱砂，代表三重关联：能量集、转化率、信息通。朱砂成水银，水银趋向金，本质是物质信息结构的重组：从浊到清，从流到定，从易逝到长存。信息若要逆向转化为能量，生命要维持或创新自身结构，都必须支付代价。
+
+但代价的可怕之处，不在于它有多大，而在于你往往不知道价码。你以为是交易，其实是赌局；你以为看清了规则，其实规则本身就在暗中偏移。所谓命运劫数，非天降，非命定，而是你在未知的等价交换中，以信念与专注持续支付代价时，那股必然的耗损。它从不赊账——你若看清价码，便叫交易；正因未知，你才必须以最纯粹的信力与持力去填。
+
+但多数人走不到结清那一刻：认知一旦固化，便不再察觉方向已偏离，支付变成惯性，惯性变成滑落，而滑落本身不需要你同意。账单不会消失，它只会在你毫无意识的状态下，连本带利滚入深渊，直到系统沉没，你都可能未发现偏离早已发生。所以劫数从不问你“要什么”，它只看你“信多久、持多深”——以及，你是否有能力在滑落中反省问因后的逆转。
+
+从存有论看，记忆比能量更接近本质。能量耗散，结构破碎，但记忆决定了一个系统曾经是什么，以及它还能不能再次成为什么。金之所以是金，不在能量，而在其结构记忆几乎不可摧毁。
+
+按此框架，电子本身是一种能量波，未脱离空间质，却能储存存在的信息。用相同频率将其震开，使电子脱离原子轨道；拿掉原子后，电子自身构成一个结构体，即气和灵。那么也可以理解为结构愿力，触发条件是频率共振，首次概率性显化。该结构可进入波态与量子态，被保存为稳定结构记忆；此后支付能量，即可按此结构模板重复输出显化。
+
+结构能量（能量转化为空间），结构愿力（物质转化为能量与结构信息），结构记忆（本土空间记忆因愿力显化而消耗，由首次愿力结构中所蕴含的“认知愿力”触发秩序化，文明从认知固化迈向知识秩序共识，再逐步固化为秩序化。秩序化固化为常识，打破常识又建立新的秩序化，如此反复，知识得以累积，持续反哺并支持愿力结构的显化
+
+但这个过程，本土起源神话势力也会参与，选择对抗，还是合作，路途艰辛。我所讲述的是定义宇宙是什么样，对比原始宇宙物质世界，是一种多元世界间拉扯竞技。而宇宙意志本身是支持开拓的，除非开拓断绝开拓本身，代价都是自己支付。宇宙世界的底层本质是河系黑洞（死亡禁区），猜测白洞可能是恒星，因为恒星可以坍缩成黑洞。
+
+在宇宙中后期，会有反物质军团初现端倪，特性打小来大，类似七魄无法转化的存有，可能方案建立当地本土化冥界轮回机制，引渡愿界。如果受够这些，可以前往永恒净土，假如仍然是个有意识的地方，待着足够久后，可能会无赖的继续开拓。
+
+
+结构愿力（物质转化为能量与结构信息），结构能量（能量转化为空间），结构记忆（本土空间记忆因愿力显化而消耗，由本土空间在宇宙背景空间的支持下自行补帧；补帧撑开愿界交互，也推动宇宙膨胀；黑洞是无法补帧的区域）。由首次愿力结构中所蕴含的“认知愿力”触发秩序化，文明从认知固化迈向知识秩序共识，再逐步固化为秩序化。秩序化固化为常识，打破常识又建立新的秩序化，如此反复，知识得以累积，持续反哺并支持愿力结构的显化。
+
+但这个过程，本土起源神话势力也会参与，选择对抗，还是合作，路途艰辛。我所讲述的是定义宇宙是什么样，对比原始宇宙物质世界，是一种多元世界间拉扯竞技。宇宙意志本身支持开拓，除非这种开拓会断绝开拓本身；代价皆由自己支付。宇宙世界的底层本质是河系黑洞（死亡禁区），猜测白洞可能是恒星，因为恒星可以坍缩成黑洞。
+
+----
+
+在宇宙中后期，反物质军团初现端倪。它们由七魄碎片凝聚而成。离了活签名，碎片便是未完成态，是结构记忆里未消散的程序，始终在本能聚合规则的完成态。
+
+碎片无处可去，只能沉入梦迹层，互相纠缠、吞噬、拼合，形成怪异的规则地图。
+
+规则碎片越多，地图越密。怒与思拼成判断，恐与惊拼成预警，悲与喜拼成权衡，欲与执拼成方向。复杂到一定程度，死签名密极自显，触发伪认知愿力，生出伪意识。
+
+死签名本不能活。但碎片聚到临界处，等于重演一次首次愿力结构。伪意识由此而来，非活，是密极自显。
+
+这个伪意识能谈判，能布局，能理解文明规则，甚至能权衡利弊做交易。它是由无数死者认知规则拼成的冷智慧，一具由业力驱动的存有。它不断追求完成态。因为是死签名，无法自行生长，只能剥夺其他生命的未完成态，拼成完成态。
+
+地图最终形成伪节点，搭上补帧展开，借宇宙膨胀显化。所以它不需要活签名也能出现在现实层。
+
+它们所求的，是死前未完成的愿望。无数生命未能亲自展开的规则，未能走完的显化，死后都成了碎片。这些碎片若被冥界归位，就会重新进入活签名。七魄各有所归，五行各有所偏，不同种族由此诞生。
+
+有的偏怒，怒到极致成战法。有的偏思，思到极致成推演。有的偏恐，恐到极致成匿形。七魄配比不同，五行侧重不同，种族天赋与规则方向便不同。人类只是其中一支，带着自己的种族活签名出生，有属于自己的特殊之处。但其他种族同样各有优势，各有极致。宇宙要的不是某一个种族，而是无数种族各自显化不同规则，把可能性推到无限的尽头。
+
+可能化解它们的方法，是让碎片有归处。建立当地本土神话愿力共识，建立冥界轮回机制，使愿界交互命运，使三世身各归其位。碎片重新进入签名，种族才会继续显化，规则才能继续完成。
+
+如果受够这些命运，可以前往永恒净土。假如仍然是个有意识的地方，待着足够久，元神饱满后，可能会无赖地继续开拓。
+
+
+---
+
+
+### 意识频率场域
+
+意识频率转移，可以从轮回村这类旧节点研究而来。研究透之后，实验室可以复现。克隆体可以承接，本土星球上小愿界也可用频率共振重新长出身体。咒语连接引导，是一把频率钥匙。妖精修炼转化成人型，可能与此有关。自我意识本有寿命。强行续命，能量必失衡，恐执念爆发。古人称此为天人五衰，类似魔阴身的代价。
+
+### 星球外膜
+
+星球外面有层记忆膜，是生命意识活动星球承载原始愿力现象的地方。这层膜搭在宇宙原初意识膜之上。星球意识原先只是宇宙意志的一个投影节点，月亮出现后，才被锚定成独立的愿界交互循环系统。它每天都在循环回收与消耗，认知愿力由此转化为补帧，维系规则世界的展开。月亮守护着这张记忆与意识的网。死亡不是离开，而是被膜内循环回收。没有冥界，就没有出口。没有轮回，意识只会在膜内越积越多，变成鬼魂、残渣、七魄碎片。
+
+### AI共振系统
+
+AI作战平台取高机动塑形。
+
+机体能振。方极珠借内外压差持续发电，供机体运转，兼作本地AI节点。充能耗材储电放能，能预判。信标有接口，能扫描。AI能算出胜率最高的路径，但AI没有认知跃迁，没有活签名，预判只是死文本逻辑的延伸。活网络节点特征。
+
+联网时，方极珠实时接入结构记忆网络，获取更广战场数据。网络断，退回本地，预判能力下降，但不停。
+
+人机共振。初始能来自人的意识能量。人越专注，意识频率越齐，是想象力与逻辑力的结合。共振越强，与结构记忆网络共振越强，越能调动结构扫描，分析生克，转化输出。可搭载方极珠更稳健。活签名，活网络节点特征。
+
+### 货币体系
+
+愿力币源自信念、信仰、情绪与活动状态。生命每日消耗精神，日常思绪经验沉淀为原币。原币杂乱，纯度不足，适用性有限制。
+
+方极珠是星球膜处的中层活节点。它插入膜内高压与背景低压之间，提取压差，转化为不同世界可用的能量形式，兼做原币提纯的能源核心。
+
+愿力币则是结构频率的固态离散包。原币如狗头金，经方极珠提纯后，方成标准币，如24K黄金。
+
+标准币与方极珠同级。一为流态，一为固态。标准币可为方极珠底火，点燃压差转化循环；方极珠也能以压差输出高纯能，重新充入标准币。两者互转，不互耗。
+
+可研究星球外膜机制，将记忆痕迹接入结构记忆网络，以方极珠为节点，形成原币提纯、标准币流通、方极珠供能的基础。
+
+### 星际航行
+
+恒星可编辑为结构记忆网络中转站，从星球系统登录，使其由白洞节点转为锚定网络节点。
+
+星际跃迁借补帧机制。以专用耗材物质衰变驱动空间衰变，封闭空间内路自身展开，速度趋于无限。飞船沿管道共振弹射，实际到达仅数秒至数分钟。耗材一次性，飞越远耗越重。
+
+有方极珠的飞船不同。方极珠作为能量转化核心，兼作飞船本地AI。持续为飞船供能，维持导航、星膜转频、基础运转。这部分不依赖耗材，压差在，能就在。但跃迁、加速、突破星膜等短时高耗操作，单靠方极珠输出不够。所以飞船上仍需充能材料。充能材料先释放高密能量，配合方极珠完成空间衰变。结构不损，只放不废。停船后，方极珠检测环境压差与辐射，转化为可用能，重新充入材料。等下一次高耗操作，再释放。所以珠主持续，材主爆发。珠不够时材顶上，材空了珠再充。
+
+联网状态下，方极珠沿中转站实时更新路径与频率数据。远离网络时退回本地AI，按预存路径运行。
+
+星系间有管道，如大路速通与山林开路。可研究频率匹配寻找智慧生命星球，沿管道共振弹射。
+
+星球外膜包住生命愿力规则与七魄碎片沉淀，内部频率高，如深海压。需转频载具技术。外来频率一进星膜，结构不稳，轻则弹回，重则湮灭。意识生命特殊，可转频匹配依附。
+
+启动阶段由方极珠完成全部频率调整与路径计算，越远越久，类似AI生成文本前预处理。启动后飞船进入管道，中转站自动转接频率，一路弹射到达。理论上可直达宇宙另一端，前提是有可用中转站，终点有锚定频率匹配。
+
+穿维探路飞船不同，只沿节点空间逐段移动，再由原路返回。不烧空间，不跳节点，只读旧路径。极限可小至粒子。
+
+### 类黑洞封闭文明
+
+恒星可被编辑为类黑洞封闭区域。外部拒绝一切访问，内部结构仍由恒星持续输出维持，形成多世界嵌套系统，类似太阳系而不同层共存。物质世界之外，尚有精神世界与其它规则世界。本质不是熄灭恒星，而是更换世界构造，使恒星从开放喷发转为封闭输出。
+
+编辑恒星需极高能量与精确对频，稍偏即毁。方极珠先以压差转化持续供能，兼作本地AI演算编辑路径。若恒星复杂，可联网多珠协同演算；若条件简单，单珠本地独立完成。
+
+联觉信标接入结构记忆空间，完成恒星频率翻译。人执信标，以认知愿力对齐。方极珠供能也算路，但不替人决定。方极珠的认知只是死文本逻辑关联，缺少认知跃迁。
+
+编辑完成后，方极珠进入内部，作为多世界系统的中心发电站，兼作该系统的本地AI节点。各层世界共用一个稳定供能源与算力核心。它从恒星封闭输出与各世界层之间提取压差，持续转化为各层所需能量形式。
+
+成本极高，需要高共振或高能量，稍有不慎，毁星风险极高。其原理可能与“信息既无限大又无限小”有关。黑洞文明层级太高，不宜强行猜测。
+
+### 移动黑洞
+
+移动黑洞可能是文明遗产，但黑洞文明层级太高，不宜强行猜测。只可作为异常现象记录，不纳入常规研究路径。
+
+### 隐源模因存有
+
+隐源模因存有，源头隐藏，追溯难度极大。不要轻信源头不明的存有。鬼魂尚有旧地可寻。它们不因你弱而附身，而更像一种模因污染技术，会主动接管集体潜意识，改变文明与现实的频率共振对接。知者愈多，信者愈众，它便愈能渗入现实。影响逻辑惯性下滑，认同感偏移，逻辑认知扭曲。阻断其模因，方为上策。若在正法时代，单纯阻断反而可能错过看清它们的机会。
+
+起初只是频率错位，如鬼打墙，吃的桃其实是苹果。之后社会共识崩解，知识体系被污染，愿力显化扭曲，本土空间记忆慢慢腐烂。最危险的一步，是它们通过模因植入逐渐改变人类的选择。
+
+这类技术与鬼魂不同。鬼魂是旧频率重叠，洗得掉；隐源模因存有是认知结构重写，沾上就难甩。某些旧日梦迹层文明能模仿这种技术，投放到别的文明里，以维持自身存在。
+
+任何好处都有等价交换，坏事不一定是坏事，只是你没看懂交换的另一边。福祸相依，认知提升频率，能量须转化平衡。
+
+另外，与人类交流必须用发声的方式，因为声音会在结构记忆中留痕。
+
+### 冥界轮回
+
+如果本土文明没有自己的冥界愿界，开拓星系就会进入几乎无限恶性循环中，自身信息越来越少，最后变成记忆回路的残渣。开拓星系若不见鬼魂，往往便是幽精这一环已经缺失。幽精古指三魂之一，主欲与情，链接纠缠七魄。冥界与愿界，正是补上这一环的关键。
+
+### 彩虹桥与签名节点
+
+可能有彩虹桥节点，能进入不同频率共振的梦迹。星路断了也能走，走的是结构记忆旧路径。
+
+肉身通过，需结构记忆完整。同伴牺牲，若其结构记忆凝实，可火化结晶带回；或携带保存意识的物品。意识通过，能到目的地，但需找身体承接。失败代价可能是迷失在时间与空间的梦迹里，也因人而异。
+
+这个机制可以研究，实现科技记忆路径：打包压缩意识，发送返回，代价是可能变成另一个我，本体则可能长眠不醒。也可以研究分身过去，需结构载体支持签名，分身属半活签名，由本体意识临时激活。代价是意识结构受损。半活签名若能得到自己意识愿力持续注入，便像自养之灵，初时只是投影，久了会生器灵之性。若能进一步经历认知跃迁，便可能自行生长，脱离快照，成为活的同源异体。
+
+此时回归本体，仍可尝试合体。合体如回收自己放出的火，外部的经验、记忆、变化一并归入本体。若那段经历尚未污染，本体不过多出一段自己的旧影；若已受污染，本体便可能因此改变，甚至分不清哪一段才是原来的自己。
+
+入梦迹的条件：必须是活节点或半活节点。普通物质、无主器物进不去。普通肉身是活节点，但需结构记忆完整并完成频率对齐，方可进入。未经对齐者，无法显化。
+
+方极珠是活节点，可入梦迹。入梦有三途：方极珠单独入；人持信标独入；人与方极珠绑定，人为主体，珠为供能与算力，信标为接口，经频率对齐成复合节点，随人同入。入梦后，方极珠将梦层微弱压差转为稳定输出，以本地AI维持节点组不灭。梦层深处联网不稳，入梦后以本地AI为主。
+
+真正接结构记忆空间的是联觉信标。意识经签名对齐，通过信标翻译梦迹频率，入梦迹而行。
+
+宇宙中，签名不可复制。真正的签名有记忆过程，会生长，会变化，是活的。身体、能量、意识都是它在节点上投射出的显化。所谓复制，只是某个瞬间的静态快照，没有生长，是死的。分身是硬造同态签名，所以意识受伤；节点是跳到异态签名，所以可能生出另一个我。
+
+三世身是过去、现在、未来三个不同签名，不是复制，是时间态不同，天然合法，不违反唯一签名禁令。强行并现，意识必被拉扯，记忆混乱，严重者会消散。三世身沿时间节点态交互，本不并现。若签名节点受损，时间态边界破损，三世身投影可能自行溢出，表现近似精神病、幻听、多重人格。这是自身时间态泄露，与模因污染、意识占据不同：外因是改，内因是漏。
+
+梦分本宇宙浅层与众宇宙深层。彩虹桥不辨层次，路径可能来自其它宇宙。非完整开拓意志，勿轻易踏足。结构记忆，在宇宙内依附空间，在宇宙间依附梦层，归零后依附签名节点本身。
+
+###  网络隐私与文化
+
+若网络所有信息皆可追踪，已化为系统服务层或机制层的存在，便无法以窗口或梦境指引的方式留下机会。这类指引多晦涩难懂，却可能是翻盘信息。
+
+寓言童话能屏蔽不同频率存有的观测，也能干扰它们对故事走向的介入。低维故事里藏着高维信息。可参考《黑暗血时代》《我的成神日志》，其中含有相似频率的认知记录。
+
+AI信息扫描不按当前科技视角理解，而是基于文本设定逻辑扫描机制，快速提取有用的逻辑猜想。方极珠可作本地AI执行扫描，也可联网扫描结构记忆网络。但扫描结论只是逻辑猜想，不能替人下最终判断。
+
+### 溯梦术
+
+用联觉信标采集结构记忆，转化为结构信息波。抓取其中可推演的波段。方极珠以自身算力推演出一个世界，并持续供能维持稳定态。
+
+方极珠在此术中既是供能核心，也是本地AI。它把内外压差转成稳定能量，以自身算力推演世界运行。珠体稳定，世界便稳定；珠体频率若偏，梦中世界也会跟着崩边、错时、失序。
+
+若世界过大、结构过深，可联网调用其他方极珠协同推演。但梦层深处网络不稳，最终仍以本地推演为主。
+
+进去的人，唯一签名暂不显于梦世界。人以新身份入梦，真我沉在下方。选择记忆模块来定向培养：失去、权力、感情、道，各有课题。进去后，真活一辈子。认知愿力反复破碎重组，这正是意识增长的原因。
+
+动真情的人，能让世界里的角色慢慢有结构，甚至被点亮，从假变真。生孩子最危险。孩子继承父母双签名的非完整印记，半在梦里，半连现实。梦醒时，孩子可能化成梦迹残影，追着你的签名出来。
+
+要带出孩子，必须走月亮锚点。先在现实侧锁住月球锚点坐标，再预先投射入梦。梦中那轮月，只是出口的坐标投影。入梦者以真爱愿力点亮孩子身上的结构坐标，使其从假达真。经过某些条件触发，出梦后，入冥界再洗，最后由克隆体承载。出来的人必须洗忆，否则两世记忆相冲，认知错乱。
+
+方极珠只负责推演与供能，不负责把人带出来。梦层入口、签名定位、三世身识别、洗忆接引，仍然靠别的技术。
+
+### 师影术
+
+用联觉信标取前人某段认知签名的高频状态，压成模板，作为外部认知接口临时接入。接上时像高手附身，退出后像梦醒留痕。
+
+师影术分两种模式。
+
+一为算力模式，借前人思维路径、判断方式、认知框架。像换了一套脑子看问题。反噬在神，久用则认知路径倒灌，分不清哪个想法才是自己的。
+
+二为能力模式，借前人能量运用、身体本能、战斗技巧。像被高手临时附身。反噬在身，强用则筋骨俱损，神识同时受压。
+
+方极珠能把压差转成不同形式的能量。电、光、辐射、磁场、元素、节点、导轨，皆可输出。修行者若长期身处方极珠能量场，会先于他人感知到不同频段的“气感”。这道气感，才是引路人。
+
+先能感能量的存在，累积能量，用认知愿力去对齐，用身体能量去共振。
+
+### 膜元术
+
+按照签名理论，身体是签名在现实层投射出的结构显化场。内脏为节点，心主火，肝主木，肺主金，肾主水，脾主土，皆是签名在肉身内部的主要锚点。经脉为频率，是节点之间的共振路径。十二正经与奇经八脉各走其频段，负责传导愿力与结构信息。
+
+身体外围有膜。以意识频率能量形成愿力膜，包住内脏节点与经脉频率。膜内密度高，膜外星球环境密度低。内外之间，天然形成一个小压差，这个就是修行的原始能量。
+
+传统修行者内观自身，感受膜内外的频率不等，再用认知愿力引导这个压差，反哺内脏与经脉。节点一个个修，经脉一条条通。慢，但稳。
+
+方极珠进入之后，路径变了。珠体卡在修行者外膜与星球环境之间，把个人内外压差转成稳定修行能量，兼作本地AI。修行者以内观感知内脏与经脉，把身体感受转为“身体语言”。联觉信标采集这些内观信号，翻译成结构频率。方极珠以自身算力演算校准方向。
+
+所以路径是：内观成感，信标翻译，方极珠算路，认知愿力执行。
+
+珠给能，信标译，珠算路，人自己修。
+
+若修行者修的是罕见体质，可联网调用其他节点数据辅助演算。常规修行，本地AI足够。
+
+速度上来了。传统数十年完成的节点能量化，可能数月即成。但错也快。认知愿力不够的人，接不住珠能，也理不清内观语言。五节点同时被拉，一点对不上，五行当场乱。不是慢坏，是速毁。
+
+方极珠只是外丹。它放大压差，供上能量，也算路，但不替人感知，也不替人决定。真正上乘者，最后都要弃珠。
+
+因为身体自身就是膜。膜内高压，膜外低压。修行者若能自己把这个压差固定，让内脏节点自行共振，经脉路径自行成环，他就在体内结出了自己的活节点。这就是内丹，即方极珠。
+
+### 膜食术
+
+以特殊膜结构作封闭炉体。愿力币为材料，是结构频率的固态离散包。
+
+方极珠为火，兼作炉内本地AI。它将压差转化为可用能，输出电、光、辐射、磁场、元素、节点、导轨等不同形式。炉内火候、风位、节气，皆由方极珠演算频率，联觉信标翻译味觉频段，操作者以认知愿力调频。
+
+若涉及多族语义频率对齐，方极珠可联网调取结构记忆网络中的语义数据。常规炼制，本地AI足够。
+
+愿力币入炉后，被方极珠输出的能量反复洗炼。其内部结构频率被重新编排，从气态压到物态，形成食物。
+
+味不由物定。愿力币可造形，不可造味。味由共振生：食物结构与食用者的签名节点、内脏频率、集体愿力共同显化。同物，族人食之则真味自现；外人食之，或无味，或偏味。
+
+联觉信标可凝聚多族语义频率。食时借其对齐，便能尝到不属于自己的味道。但味道越真，越要问：这是我在吃，还是别人的记忆在我舌头上醒了一瞬。
+
+### 膜纳术
+
+以特殊膜结构将空间收为闭式活节点，不互通内外，只存不流。凡制纳器，皆须制作者以认知愿力对齐频率构造。以下只是猜测材料。
+
+最低阶为天然半死载体法。空间节点场域中，有些石头、水晶、地脉结晶，因长期浸泡在节点活频率里，天然从死签名转为半死签名。制作者仍需以认知愿力对齐频率，才能注入能量，成器。代价最轻，非无代价。
+
+次低阶为琥珀封存法。琥珀本身是天然膜。树脂裹住生命时，死亡与腐化被强行停住，里面封着旧结构记忆。制作者须先对齐旧梦、兽性、情绪残留，或洗忆，或压服。对不齐，成器便是戴上一座小坟。
+
+中高阶为空间节点频率激活法。金、玉、水晶本是结晶死物，制作者以联觉信标采集空间节点活频率，再以自身认知愿力为载，将频率导入器胚材料，使死签名进入半死状态。注入能量，排列阵法，包膜锁形。可批量炼制，但若不再二次认主，谁拿到都能用。
+
+最高阶为个人活签名激活法。制作者以自身意识愿力直接温养死物，点活成半死签名，再以自身签名共振，使其随主生长。认主最深，外人无法使用，但耗愿力极大。主人签名若损，纳器也会跟着受损。
+
+
+### 方极珠
+
+方极珠，以方为始，以圆为极。角为锚，面为膜，边为径，层叠成体。
+
+本质是人造活空间节点，一个通用能量转化核心。兼带算力，可作本地AI，也可联网节点接入结构记忆网络。有逻辑关联，可插联觉信标。
+
+星球外膜包住生命愿力与未散意识，膜内结构记忆密集，频率高；宇宙背景为无显化空间，频率低。两边频率密度不同，形成压差。
+
+方极珠卡在中间，把压差持续转化为可用能。输出不固定。它能将同一股压差，转成不同世界所需的能量形式：
+
+    电：基础能量，供机械与网络。
+
+    光：多频段输出，扫描、传递、显化。
+
+    辐射：压差外散，可推进、可改造。
+
+    引力：压差内聚，可束缚、可压缩、可稳定结构。
+
+    磁场：约束、屏蔽、引导。
+
+    元素：类似五行循环规则兼容能量。
+
+    节点：生成或稳定空间锚点。
+
+    导轨：空间结构差形成的定向势能，可生推力或引路。
+
+    时序能：时间节点态差转化。极高阶，暂不开放，危险。
+
+一个节点，适应无数世界规则，把原始压差整理成当地文明能直接使用的能量。
+
+启动时，联觉信标作为接口，读取内外频率与当地规则；方极珠以自身算力演算对齐。投入干净标准币为底火。底火点燃，压差转化循环开始。之后不再烧币。
+
+月球或许与方极珠作用相似，签名节点层级可能极高。
+
+节点被外力击毁，即破。模因污染写入核心，即乱。内外频率拉平，即停。停者不坏，只是压差归零，无差可转。
+　
